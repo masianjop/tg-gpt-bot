@@ -22,12 +22,16 @@ OPENAI_PROJECT = os.environ.get("OPENAI_PROJECT", "")
 ENDPOINT = "https://api.openai.com/v1/chat/completions"
 MODEL = "gpt-4o-mini"
 
-print(f"[BOT] endpoint={ENDPOINT} model={MODEL} project='{OPENAI_PROJECT}'")
+# Порог суммы (можно менять через переменную окружения MIN_SUM; 0 = отключить порог)
+MIN_SUM = float(os.getenv("MIN_SUM", "0"))  # раньше было 1_000_000
+
+print(f"[BOT] endpoint={ENDPOINT} model={MODEL} project='{OPENAI_PROJECT}' min_sum={MIN_SUM}")
 
 THREADS = {}
 
-SYSTEM_PROMPT = """Ты — Product Data Assistant. Отвечай кратко, по делу, на русском.
-Если тема — таблицы и тендеры, помогай чётко и структурировано.
+SYSTEM_PROMPT = """Ты — ассистент отдела продаж МЦЭ Инжиниринг.
+Работаешь только с тендерами, лидами, сделками и таблицами.
+Не обсуждай товары, маркетплейсы, бытовую продукцию и прайс-листы.
 """
 
 # ========= OPENAI CALL (для обычного чата) =========
@@ -106,7 +110,7 @@ def _find_col(df: pd.DataFrame, aliases) -> str | None:
             return c
     return None
 
-# ========= СЕМАНТИКА (расширено по твоему docx) =========
+# ========= СЕМАНТИКА =========
 KEYWORDS = [
     # учёт/измерение/узлы
     "сикг","сикн","сикнс","сикк","уирг","ууг","уун","асн","асу тп","асутп",
@@ -132,7 +136,6 @@ KEYWORDS = [
 ]
 
 CLIENTS = [
-    # группы заказчиков
     "газпром","газпромнефть","лукойл","роснефть","славнефть","самаранефтегаз","няганьнефть",
     "восток-оил","инк","ннк","ритэк","башнефть","метафракс","еврохим","русснефть",
     "томскнефть","мессояханефтегаз","русгаз","бск","козс","татнефть"
@@ -189,7 +192,7 @@ def _reason(row) -> str:
     if row["Score_pattern(0-1)"] > 0:  parts.append("тендерный шаблон")
     return ", ".join(parts) if parts else "значимых совпадений нет"
 
-def mce_filter_scored(df_in: pd.DataFrame) -> pd.DataFrame:
+def mce_filter_scored(df_in: pd.DataFrame) -> (pd.DataFrame, dict):
     df = df_in.copy().fillna("")
     # авто-поиск колонок
     name_col    = _find_col(df, NAME_ALIASES)    or "Название"
@@ -202,11 +205,12 @@ def mce_filter_scored(df_in: pd.DataFrame) -> pd.DataFrame:
 
     df[name_col]    = df[name_col].astype(str)
     df[company_col] = df[company_col].astype(str)
-    # оставляем строковые суммы как есть — ниже coerce для масок
+
     # скоринг
     kw  = df[name_col].apply(_score_keywords)
     cl  = df[company_col].apply(_score_client)
-    amt = pd.to_numeric(df[amount_col], errors="coerce").fillna(0).apply(_score_amount)
+    amt_vals = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0)
+    amt = amt_vals.apply(_score_amount)
     pat = df[name_col].apply(_score_pattern)
 
     df["Score_keywords(0-4)"] = kw
@@ -219,27 +223,46 @@ def mce_filter_scored(df_in: pd.DataFrame) -> pd.DataFrame:
 
     # базовый смысловой проход
     base_mask = (kw >= 1) | (cl >= 1) | (pat >= 1)
-    # сумма: >=1 млн, но допускаем 0 если сильно наши по предмету+клиенту
-    amounts = pd.to_numeric(df[amount_col], errors="coerce").fillna(0)
-    sum_mask = (amounts >= 1_000_000) | ((kw >= 2) & (cl >= 1))
+
+    # НОВОЕ ПРАВИЛО СУММЫ:
+    # - если MIN_SUM == 0 → не отсеивать по сумме (только по смыслу)
+    # - если MIN_SUM > 0 → пропускать суммы >= MIN_SUM
+    #   и также пропускать "наши" строки даже при 0 сумме: (kw>=1 или pat>=1)
+    if MIN_SUM <= 0:
+        sum_mask = (amt_vals >= 0)  # всегда True
+    else:
+        sum_mask = (amt_vals >= MIN_SUM) | (kw >= 1) | (pat >= 1)
 
     out = df[base_mask & sum_mask].copy()
     out["Priority"] = out["Score_total(0-10)"].apply(_priority)
     out["Причина"] = out.apply(_reason, axis=1)
 
-    # сортировка: High → Medium → Low, затем по Score, затем по сумме
+    # сортировка
     prio_order = {"High":0, "Medium":1, "Low":2}
     out = out.sort_values(
         by=["Priority","Score_total(0-10)", amount_col],
         key=lambda s: s.map(prio_order) if s.name=="Priority" else pd.to_numeric(s, errors="coerce"),
         ascending=[True, False, False]
     )
-    return out
+
+    # Диагностика для сообщения
+    diag = {
+        "name_col": name_col,
+        "company_col": company_col,
+        "amount_col": amount_col,
+        "kw_hits": int((kw >= 1).sum()),
+        "client_hits": int((cl >= 1).sum()),
+        "pattern_hits": int((pat >= 1).sum()),
+        "sum_ge_min": int((amt_vals >= MIN_SUM).sum()) if MIN_SUM > 0 else len(df),
+        "total_in": len(df),
+        "total_out": len(out)
+    }
+    return out, diag
 
 # ========= КОМАНДЫ =========
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Кидай Excel/CSV — я отфильтрую тендеры, выставлю приоритеты и объясню, почему выбрал.\n"
+        "Привет! Кидай Excel/CSV — я отфильтрую тендеры, поставлю приоритеты и объясню почему выбрал.\n"
         "Команда: /reset — очистить контекст."
     )
 
@@ -265,7 +288,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========= ПРИЁМ ФАЙЛОВ =========
 def _read_table_any(local_path: str, suffix: str) -> pd.DataFrame:
     if suffix == ".csv":
-        # пробуем utf-8 → cp1251
         try:
             return pd.read_csv(local_path, sep=None, engine="python")
         except Exception:
@@ -290,32 +312,40 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if suffix in {".xlsx", ".xls", ".csv"}:
         try:
             df = _read_table_any(local_path, suffix)
-            scored = mce_filter_scored(df)
+            scored, diag = mce_filter_scored(df)
 
-            total_in  = len(df)
-            total_out = len(scored)
-            by_prio = scored["Priority"].value_counts().to_dict()
+            total_in  = diag["total_in"]
+            total_out = diag["total_out"]
+            by_prio = scored["Priority"].value_counts().to_dict() if total_out else {}
             high = by_prio.get("High", 0)
             med  = by_prio.get("Medium", 0)
             low  = by_prio.get("Low", 0)
 
             # превью 5 строк с причинами
-            name_col = _find_col(scored, NAME_ALIASES) or "Название"
             preview_rows = []
-            for _, row in scored.head(5).iterrows():
-                title = str(row.get(name_col, ""))[:140]
-                prio  = row["Priority"]
-                sc    = row["Score_total(0-10)"]
-                why   = row["Причина"]
-                preview_rows.append(f"• [{prio} | {sc}] {title}\n   — {why}")
+            if total_out:
+                name_col = diag["name_col"]
+                for _, row in scored.head(5).iterrows():
+                    title = str(row.get(name_col, ""))[:140]
+                    prio  = row["Priority"]
+                    sc    = row["Score_total(0-10)"]
+                    why   = row["Причина"]
+                    preview_rows.append(f"• [{prio} | {sc}] {title}\n   — {why}")
 
             out_bytes = _to_excel_bytes(scored, sheet="MCE_scored")
 
+            diag_text = (
+                f"Колонки: Название→{diag['name_col']} | Компания→{diag['company_col']} | Сумма→{diag['amount_col']}\n"
+                f"Совпадения: keywords={diag['kw_hits']}, clients={diag['client_hits']}, patterns={diag['pattern_hits']}"
+                + (f", суммы≥{int(MIN_SUM):,}={diag['sum_ge_min']}".replace(",", " ") if MIN_SUM>0 else "")
+            )
+
             await update.message.reply_text(
                 "Готово ✅\n"
-                f"Вход: {total_in} строк • Отобрано: {total_out}\n"
-                f"Приоритеты — High: {high}, Medium: {med}, Low: {low}\n\n"
-                + ("\n".join(preview_rows) if preview_rows else "Совпадений с нашими направлениями не найдено")
+                f"Вход: {total_in} • Отобрано: {total_out}\n"
+                f"Приоритеты — High: {high}, Medium: {med}, Low: {low}\n"
+                f"{diag_text}\n\n"
+                + ("\n".join(preview_rows) if preview_rows else "Совпадений есть мало или суммы отсутствуют — проверь названия/клиента/сумму.")
             )
             await update.message.reply_document(
                 document=out_bytes,
