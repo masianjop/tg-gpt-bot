@@ -11,12 +11,11 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
 import httpx
 
 # ========= CONFIG =========
 load_dotenv()
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENAI_PROJECT = os.environ.get("OPENAI_PROJECT", "")
 
@@ -28,10 +27,10 @@ print(f"[BOT] endpoint={ENDPOINT} model={MODEL} project='{OPENAI_PROJECT}'")
 THREADS = {}
 
 SYSTEM_PROMPT = """Ты — Product Data Assistant. Отвечай кратко, по делу, на русском.
-Если тема — данные о товарах или таблицы, задавай уточняющие вопросы.
+Если тема — таблицы и тендеры, помогай чётко и структурировано.
 """
 
-# ========= OPENAI CALL =========
+# ========= OPENAI CALL (для обычного чата) =========
 async def call_openai(lines: list[str]) -> str:
     msgs = []
     for ln in lines:
@@ -67,7 +66,7 @@ def get_history(uid: int) -> list[str]:
         hist.append(f"system: {SYSTEM_PROMPT}")
     return hist
 
-# ========= ВСПОМОГАТЕЛЬНЫЕ =========
+# ========= FS UTILS =========
 def _safe_name(name: str, fallback: str) -> str:
     base = name or fallback
     base = Path(base).name
@@ -79,61 +78,72 @@ async def _download_to_tmp(tg_file, filename: str) -> str:
     await tg_file.download_to_drive(local_path)
     return local_path
 
-def _to_excel_bytes(df: pd.DataFrame, sheet="filtered") -> bytes:
+def _to_excel_bytes(df: pd.DataFrame, sheet="MCE_scored") -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name=sheet)
     buf.seek(0)
     return buf.read()
 
-# ========= СКОРИНГ ТЕНДЕРОВ (0–10) + ПРИЧИНА =========
+# ========= АЛИАСЫ КОЛОНОК =========
 NAME_ALIASES = [
-    "название", "название сделки", "название лида", "наименование", "предмет", "тема"
+    "название","название сделки","название лида","наименование","предмет","тема","лот"
 ]
 COMPANY_ALIASES = [
-    "компания","заказчик","покупатель","организация","клиент","контрагент"
+    "компания","заказчик","покупатель","организация","клиент","контрагент","инициатор"
 ]
 AMOUNT_ALIASES = [
-    "сумма","бюджет","нмцк","начальная цена","стоимость","price","amount","total"
+    "сумма","бюджет","нмцк","начальная цена","стоимость","price","amount","total","макс цена"
 ]
 
 def _find_col(df: pd.DataFrame, aliases) -> str | None:
     cols_map = {str(c).strip().lower(): c for c in df.columns}
     for a in aliases:
-        # точное совпадение
         if a in cols_map:
             return cols_map[a]
-    # по вхождению слова
     for key, c in cols_map.items():
         if any(a in key for a in aliases):
             return c
     return None
 
+# ========= СЕМАНТИКА (расширено по твоему docx) =========
 KEYWORDS = [
-    # базовые измерения/учёт/узлы
-    "сикг","сикн","сикнс","уирг","ууг","уун","асн","асу тп","асутп",
-    "узел учета","узел измерения","узел редуцирования","измеритель","измерительная установка",
-    # налив/слив
+    # учёт/измерение/узлы
+    "сикг","сикн","сикнс","сикк","уирг","ууг","уун","асн","асу тп","асутп",
+    "узел учета","узел учёта","узел измерения","узел редуцирования",
+    "измеритель","измерительная установка","система измерен","система контроля",
+    # агзу и измерительные установки
+    "агзу","измерительная установка",
+    # налив/слив/эстакады
     "система налива","пункт налива","станция налива","система слива","пункт слива","эстакада",
+    "налив нефти","слив нефти","налив метанола","герметичный налив",
+    # дозирование реагентов
+    "установка дозирования","дозирован","узел ввода реагентов","удх","удхб",
     # блочное/модульное
-    "блок-бокс","блочный","модульный блок","технологический блок",
-    # метрология/лаборатории/аналитика
-    "метрологический стенд","поверочный стенд","испытательный стенд",
-    "лаборатор","химико-аналитичес","газоаналитичес","анализатор","пробоотбор",
-    # кип/датчики/расход
-    "кип","контрольно-измерительн","датчик","расходомер","манометр","уровнемер",
-    "дозирован","автоматизац","система контроля","система измерен"
+    "блок-бокс","блочный","модульный блок","технологический блок","блочно-модульная",
+    # пробоотбор/аналитика/лаборатории
+    "пробоотбор","пробоотборник","сог","хал","лаборатор","химико-аналитичес","газоаналитичес",
+    "анализатор","хроматограф","метрологический стенд","поверочный стенд","испытательный стенд",
+    # кип/приборка/датчики/уровень/расход/давление
+    "кип","контрольно-измерительн","датчик","датчики","манометр","уровнемер","расходомер",
+    "термометр","термопара","тсп","ртд","манифольд","диафрагма",
+    # смежные термины
+    "пнр","шмр","пир","модернизация","проектирование","комплекс поставки"
 ]
 
 CLIENTS = [
-    "газпром","газпромнефть","лукойл","еврохим","инк","ннк","ритэк","башнефть",
-    "метафракс","русснефть","восток-оил","самаранефтегаз","няганьнефть",
-    "татнефть","томскнефть","мессояханефтегаз","русгаз"
+    # группы заказчиков
+    "газпром","газпромнефть","лукойл","роснефть","славнефть","самаранефтегаз","няганьнефть",
+    "восток-оил","инк","ннк","ритэк","башнефть","метафракс","еврохим","русснефть",
+    "томскнефть","мессояханефтегаз","русгаз","бск","козс","татнефть"
 ]
 
-LEAD_PATTERNS = [r"^ткп", r"^ап", r"^com", "запрос", "поставка",
-                 "система","узел","модернизация","проектирование","комплекс","блок","асутп","асу тп"]
+LEAD_PATTERNS = [
+    r"^ткп", r"^ап", r"^com", "запрос", "поставка",
+    "система","узел","модернизация","проектирование","комплекс","блок","асутп","асу тп"
+]
 
+# ========= СКОРИНГ =========
 def _any_in(text: str, bag) -> bool:
     t = str(text).lower()
     return any(k in t for k in bag)
@@ -177,11 +187,11 @@ def _reason(row) -> str:
     if row["Score_client(0-3)"] > 0:   parts.append("целевой заказчик")
     if row["Score_amount(0-2)"] > 0:   parts.append("масштаб сделки")
     if row["Score_pattern(0-1)"] > 0:  parts.append("тендерный шаблон")
-    return ", ".join(parts) if parts else "правил значимых совпадений нет"
+    return ", ".join(parts) if parts else "значимых совпадений нет"
 
 def mce_filter_scored(df_in: pd.DataFrame) -> pd.DataFrame:
     df = df_in.copy().fillna("")
-    # обнаружение колонок
+    # авто-поиск колонок
     name_col    = _find_col(df, NAME_ALIASES)    or "Название"
     company_col = _find_col(df, COMPANY_ALIASES) or "Компания"
     amount_col  = _find_col(df, AMOUNT_ALIASES)  or "Сумма"
@@ -190,15 +200,13 @@ def mce_filter_scored(df_in: pd.DataFrame) -> pd.DataFrame:
     if company_col not in df.columns: df[company_col] = ""
     if amount_col not in df.columns:  df[amount_col] = 0
 
-    # нормализация типов
     df[name_col]    = df[name_col].astype(str)
     df[company_col] = df[company_col].astype(str)
-    df[amount_col]  = pd.to_numeric(df[amount_col], errors="ignore")
-
+    # оставляем строковые суммы как есть — ниже coerce для масок
     # скоринг
-    kw = df[name_col].apply(_score_keywords)
-    cl = df[company_col].apply(_score_client)
-    amt = df[amount_col].apply(_score_amount)
+    kw  = df[name_col].apply(_score_keywords)
+    cl  = df[company_col].apply(_score_client)
+    amt = pd.to_numeric(df[amount_col], errors="coerce").fillna(0).apply(_score_amount)
     pat = df[name_col].apply(_score_pattern)
 
     df["Score_keywords(0-4)"] = kw
@@ -209,28 +217,29 @@ def mce_filter_scored(df_in: pd.DataFrame) -> pd.DataFrame:
         "Score_keywords(0-4)","Score_client(0-3)","Score_amount(0-2)","Score_pattern(0-1)"
     ]].sum(axis=1)
 
-    # базовый проход: есть смысл (по ключам/клиентам/шаблону)
+    # базовый смысловой проход
     base_mask = (kw >= 1) | (cl >= 1) | (pat >= 1)
-    # сумма: пускаем всё >= 1 млн, но оставляем «нулёвые», если сильно наши
-    sum_mask = (pd.to_numeric(df[amount_col], errors="coerce").fillna(0) >= 1_000_000) | ((kw >= 2) & (cl >= 1))
+    # сумма: >=1 млн, но допускаем 0 если сильно наши по предмету+клиенту
+    amounts = pd.to_numeric(df[amount_col], errors="coerce").fillna(0)
+    sum_mask = (amounts >= 1_000_000) | ((kw >= 2) & (cl >= 1))
 
     out = df[base_mask & sum_mask].copy()
     out["Priority"] = out["Score_total(0-10)"].apply(_priority)
     out["Причина"] = out.apply(_reason, axis=1)
 
-    # сортировка
+    # сортировка: High → Medium → Low, затем по Score, затем по сумме
     prio_order = {"High":0, "Medium":1, "Low":2}
     out = out.sort_values(
         by=["Priority","Score_total(0-10)", amount_col],
-        key=lambda s: s.map(prio_order) if s.name=="Priority" else s,
+        key=lambda s: s.map(prio_order) if s.name=="Priority" else pd.to_numeric(s, errors="coerce"),
         ascending=[True, False, False]
     )
     return out
 
-# ========= БАЗОВЫЕ КОМАНДЫ =========
+# ========= КОМАНДЫ =========
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Кидай Excel/CSV — я отфильтрую и проставлю приоритеты.\n"
+        "Привет! Кидай Excel/CSV — я отфильтрую тендеры, выставлю приоритеты и объясню, почему выбрал.\n"
         "Команда: /reset — очистить контекст."
     )
 
@@ -254,6 +263,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 # ========= ПРИЁМ ФАЙЛОВ =========
+def _read_table_any(local_path: str, suffix: str) -> pd.DataFrame:
+    if suffix == ".csv":
+        # пробуем utf-8 → cp1251
+        try:
+            return pd.read_csv(local_path, sep=None, engine="python")
+        except Exception:
+            return pd.read_csv(local_path, sep=None, engine="python", encoding="cp1251", on_bad_lines="skip")
+    else:
+        try:
+            return pd.read_excel(local_path)
+        except Exception:
+            return pd.read_excel(local_path, engine="openpyxl")
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.document:
         return
@@ -265,17 +287,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_file = await doc.get_file()
     local_path = await _download_to_tmp(tg_file, filename)
 
-    # Таблицы: сразу считаем скоринг и возвращаем результат
     if suffix in {".xlsx", ".xls", ".csv"}:
         try:
-            if suffix == ".csv":
-                df = pd.read_csv(local_path)
-            else:
-                df = pd.read_excel(local_path)
-
+            df = _read_table_any(local_path, suffix)
             scored = mce_filter_scored(df)
 
-            # небольшая сводка
             total_in  = len(df)
             total_out = len(scored)
             by_prio = scored["Priority"].value_counts().to_dict()
@@ -283,10 +299,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             med  = by_prio.get("Medium", 0)
             low  = by_prio.get("Low", 0)
 
-            # топ-5 с причинами для сообщения
+            # превью 5 строк с причинами
+            name_col = _find_col(scored, NAME_ALIASES) or "Название"
             preview_rows = []
             for _, row in scored.head(5).iterrows():
-                title = str(row.get(_find_col(df, NAME_ALIASES) or "Название", ""))[:140]
+                title = str(row.get(name_col, ""))[:140]
                 prio  = row["Priority"]
                 sc    = row["Score_total(0-10)"]
                 why   = row["Причина"]
@@ -311,7 +328,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shutil.rmtree(Path(local_path).parent, ignore_errors=True)
         return
 
-    # Прочие файлы — эхо обратно
+    # Прочие файлы — эхо
     try:
         with open(local_path, "rb") as f:
             await update.message.reply_document(
