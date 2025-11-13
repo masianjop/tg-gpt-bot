@@ -65,7 +65,6 @@ async def call_openai(lines: List[str]) -> str:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            # OpenAI идёт напрямую, без прокси
             r = await client.post(ENDPOINT, headers=headers, json=payload)
             r.raise_for_status()
             data = r.json()
@@ -118,7 +117,6 @@ async def fetch_gpb_tenders():
 
     proxies = None
     if GPB_PROXY_URL:
-        # Ключи должны быть с "://", как просит httpx
         proxies = {
             "http://": GPB_PROXY_URL,
             "https://": GPB_PROXY_URL,
@@ -126,13 +124,28 @@ async def fetch_gpb_tenders():
 
     async with httpx.AsyncClient(timeout=30, proxies=proxies) as client:
         r = await client.get(url)
-        r.raise_for_status()
-        xml_text = r.text
+        status = r.status_code
+        text = r.text
+
+    # Логируем в Railway начало ответа
+    print("[GPB_STATUS]", status)
+    print("[GPB_BODY_START]", repr(text[:300]))
+
+    if status != 200:
+        raise RuntimeError(
+            f"API вернул статус {status}. Начало ответа: {text[:200]!r}"
+        )
+
+    if not text.strip():
+        raise RuntimeError("Пустой ответ от API (через прокси).")
 
     try:
-        root = ET.fromstring(xml_text)
+        root = ET.fromstring(text)
     except ET.ParseError as e:
-        raise RuntimeError(f"Ошибка парсинга XML: {e}")
+        # кидаем понятную ошибку с кусочком тела
+        raise RuntimeError(
+            f"Ошибка парсинга XML: {e}. Начало ответа: {text[:200]!r}"
+        )
 
     tenders = []
 
@@ -149,7 +162,7 @@ async def fetch_gpb_tenders():
             or proc.findtext("LotId")
             or "—"
         )
-        status = (
+        status_text = (
             proc.findtext("Status")
             or proc.findtext("State")
             or proc.findtext("ProcedureStatus")
@@ -162,7 +175,7 @@ async def fetch_gpb_tenders():
             {
                 "number": number,
                 "lot": lot,
-                "status": status,
+                "status": status_text,
                 "link": link,
             }
         )
@@ -183,6 +196,7 @@ async def tenders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if str(e):
             msg += f": {e}"
 
+        # покажем полную причину
         await update.message.reply_text(f"API ошибка: {msg}")
         return
 
