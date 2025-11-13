@@ -1,5 +1,10 @@
-import os, re, io, tempfile, shutil
+import os
+import re
+import io
+import tempfile
+import shutil
 from pathlib import Path
+
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -13,7 +18,7 @@ from telegram.ext import (
 )
 
 import httpx
-import json
+
 
 # ========= CONFIG =========
 load_dotenv()
@@ -21,16 +26,23 @@ load_dotenv()
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENAI_PROJECT = os.environ.get("OPENAI_PROJECT", "")
-BITRIX_WEBHOOK = os.environ.get("BITRIX_WEBHOOK", "").rstrip("/")
+
+# Bitrix: ВАЖНО — переменная в Railway должна называться именно BITRIX_WEBHOOK
+BITRIX_WEBHOOK = os.environ.get("BITRIX_WEBHOOK", "").rstrip("/")  # веб-хук вида https://.../rest/6/xxx/
+BITRIX_METHOD_LEAD_ADD = "crm.lead.add.json"
 
 ENDPOINT = "https://api.openai.com/v1/chat/completions"
 MODEL = "gpt-4o-mini"
 
 print(f"[BOT] model={MODEL}")
+print(f"[BOT] bitrix={BITRIX_WEBHOOK or 'NO BITRIX_WEBHOOK'}")
 
-THREADS = {}
+THREADS: dict[int, list[str]] = {}
 
-SYSTEM_PROMPT = """Ты — Product Data Assistant. Отвечай кратко и по делу."""
+
+SYSTEM_PROMPT = """Ты — Product Data Assistant. Отвечай кратко, по делу, на русском.
+Если тема — данные о товарах или таблицы, задавай уточняющие вопросы.
+"""
 
 
 # ========= OPENAI CALL =========
@@ -58,8 +70,10 @@ async def call_openai(lines: list[str]) -> str:
             data = r.json()
             return data["choices"][0]["message"]["content"].strip()
 
+    except httpx.HTTPStatusError as e:
+        return f"⚠️ OpenAI {e.response.status_code}: {e.response.text}"
     except Exception as e:
-        return f"⚠️ Ошибка OpenAI: {e}"
+        return f"⚠️ Локальная ошибка: {e}"
 
 
 def get_history(uid: int) -> list[str]:
@@ -69,41 +83,23 @@ def get_history(uid: int) -> list[str]:
     return hist
 
 
-# ========= BITRIX24 — СОЗДАНИЕ ЛИДА =========
-
-async def send_lead_to_bitrix(title: str, description: str, phone: str = "", name: str = ""):
-    if not BITRIX_WEBHOOK:
-        return "❌ Переменная BITRIX_WEBHOOK не установлена!"
-
-    url = f"{BITRIX_WEBHOOK}/crm.lead.add.json"
-
-    payload = {
-        "fields": {
-            "TITLE": title,
-            "NAME": name if name else "Telegram",
-            "COMMENTS": description,
-            "PHONE": [{"VALUE": phone, "VALUE_TYPE": "WORK"}] if phone else [],
-        },
-        "params": {"REGISTER_SONET_EVENT": "Y"}
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(url, json=payload)
-            r.raise_for_status()
-            data = r.json()
-
-        if "result" in data:
-            return f"✅ Лид создан: ID {data['result']}"
-        else:
-            return f"⚠️ Ошибка Bitrix: {data}"
-
-    except Exception as e:
-        return f"⚠️ Bitrix ошибка: {e}"
+# ========= БАЗОВЫЕ КОМАНДЫ =========
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я готов работать с сообщениями и файлами.\n"
+        "Команды:\n"
+        "  /lead текст лида — создать лид в Битрикс24\n"
+        "  /reset — очистить контекст."
+    )
 
 
-# ========= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =========
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    THREADS.pop(update.effective_user.id, None)
+    context.user_data.clear()
+    await update.message.reply_text("Контекст очищен ✅")
 
+
+# ========= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ФАЙЛОВ =========
 def _safe_name(name: str, fallback: str) -> str:
     base = name or fallback
     base = Path(base).name
@@ -117,17 +113,26 @@ async def _download_to_tmp(tg_file, filename: str) -> str:
     return local_path
 
 
-# ========== EXCEL/CSV ФИЛЬТРАЦИЯ ==========
+# ========== ФИЛЬТРАЦИЯ EXCEL/CSV ==========
 
 _RULE_RE = re.compile(r"^\s*(.+?)\s*(<=|>=|=|!=|<|>|~)\s*(.+?)\s*$", re.IGNORECASE)
 
+
 def _coerce_series(s: pd.Series) -> pd.Series:
-    dt = pd.to_datetime(s, errors="ignore", dayfirst=True)
-    if dt.notna().sum() >= len(s) * 0.3:
+    # пробуем дату
+    dt = pd.to_datetime(s, errors="coerce", dayfirst=True, infer_datetime_format=True)
+    if dt.notna().sum() >= max(2, int(len(s) * 0.2)):
         return dt
-    num = pd.to_numeric(s.astype(str).str.replace(" ", "").str.replace(",", "."), errors="ignore")
-    if pd.to_numeric(num, errors="coerce").notna().sum() >= len(s) * 0.3:
+
+    # пробуем число
+    num = pd.to_numeric(
+        s.astype(str).str.replace(" ", "").str.replace(",", "."),
+        errors="coerce",
+    )
+    if num.notna().sum() >= max(2, int(len(s) * 0.2)):
         return num
+
+    # иначе просто текст
     return s.astype(str).str.lower()
 
 
@@ -152,30 +157,43 @@ def _apply_rules(df: pd.DataFrame, rules):
     for col_raw, op, val_raw in rules:
         key = col_raw.lower()
         if key not in colmap:
-            explain.append(f"⚠️ Колонка «{col_raw}» не найдена.")
+            explain.append(f"⚠️ Колонка «{col_raw}» не найдена — пропустил.")
             continue
 
         col = colmap[key]
         s = _coerce_series(df[col])
 
+        # значение для сравнения
         val = val_raw
-        if pd.api.types.is_numeric_dtype(s):
-            try: val = float(val_raw)
-            except: pass
-        elif pd.api.types.is_datetime64_any_dtype(s):
-            val = pd.to_datetime(val_raw, errors="coerce")
+        if pd.api.types.is_datetime64_any_dtype(s):
+            val = pd.to_datetime(val_raw, errors="coerce", dayfirst=True)
+        elif pd.api.types.is_numeric_dtype(s):
+            try:
+                val = float(str(val_raw).replace(" ", "").replace(",", "."))
+            except Exception:
+                val = None
+        else:
+            val = str(val_raw).lower()
 
+        # оператор
         m = pd.Series(True, index=df.index)
-        if op == "=":   m = s == val
-        if op == "!=":  m = s != val
-        if op == ">":   m = s > val
-        if op == "<":   m = s < val
-        if op == ">=":  m = s >= val
-        if op == "<=":  m = s <= val
-        if op == "~":   m = s.astype(str).str.contains(str(val_raw).lower(), na=False)
+        if op == "=":
+            m = s.eq(val)
+        elif op == "!=":
+            m = s.ne(val)
+        elif op == ">":
+            m = s.gt(val)
+        elif op == "<":
+            m = s.lt(val)
+        elif op == ">=":
+            m = s.ge(val)
+        elif op == "<=":
+            m = s.le(val)
+        elif op == "~":
+            m = s.astype(str).str.contains(re.escape(str(val)), na=False)
 
         mask &= m
-        explain.append(f"{col}: {op} {val_raw} — прошло {m.sum()}")
+        explain.append(f"✅ {col} {op} {val_raw} — прошло {int(m.sum())}")
 
     df2 = df[mask].copy()
     explain.insert(0, f"Итого прошло {len(df2)} из {len(df)}")
@@ -190,113 +208,187 @@ def _to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buf.read()
 
 
-# ========= ОБРАБОТКА ТЕКСТА =========
+# ========= BITRIX: СОЗДАНИЕ ЛИДА =========
 
+async def create_bitrix_lead(
+    title: str,
+    comment: str,
+    tg_user,
+) -> str:
+    """
+    Создаём лид в Битриксе.
+    Поля можно потом расширить (телефон, компания и т.п.).
+    """
+    if not BITRIX_WEBHOOK:
+        return "❌ BITRIX_WEBHOOK не задан в переменных окружения."
+
+    url = f"{BITRIX_WEBHOOK}/{BITRIX_METHOD_LEAD_ADD}"
+
+    fields = {
+        "TITLE": title or "Лид из Telegram",
+        "COMMENTS": comment or "",
+        "SOURCE_ID": "WEB",
+        "STATUS_ID": "NEW",
+        "NAME": tg_user.first_name or "",
+        "LAST_NAME": tg_user.last_name or "",
+    }
+
+    payload = {
+        "fields": fields,
+        "params": {"REGISTER_SONET_EVENT": "Y"},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+
+        if "error" in data:
+            err = data.get("error_description", data["error"])
+            return f"❌ Bitrix вернул ошибку: {err}"
+
+        lead_id = data.get("result")
+        return f"Лид создан в Битрикс24 ✅ (ID: {lead_id})"
+
+    except httpx.HTTPStatusError as e:
+        return f"❌ Bitrix HTTP {e.response.status_code}: {e.response.text}"
+    except Exception as e:
+        return f"❌ Ошибка при запросе в Bitrix: {e}"
+
+
+# ========== ОБРАБОТКА ТЕКСТА ==========
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    uid = update.effective_user.id
     text = update.message.text.strip()
 
-    # ******* СОЗДАНИЕ ЛИДА ********
-    if text.lower().startswith("лид "):
-        title = "Лид из Telegram"
-        desc = text[4:].strip()
-        ans = await send_lead_to_bitrix(title, desc)
-        await update.message.reply_text(ans)
+    # ---- если ждём правила фильтрации для Excel/CSV ----
+    if context.user_data.get("awaiting_filters") and context.user_data.get("pending_file_path"):
+        rules_text = text
+        local_path = context.user_data["pending_file_path"]
+        filename = context.user_data.get("pending_file_name", "filtered.xlsx")
+        suffix = Path(filename).suffix.lower()
+
+        try:
+            if suffix == ".csv":
+                df = pd.read_csv(local_path)
+            else:
+                df = pd.read_excel(local_path)
+
+            rules = _parse_rules(rules_text)
+            df2, explanation = _apply_rules(df, rules)
+
+            out_bytes = _to_excel_bytes(df2)
+            await update.message.reply_text("Готово ✅\n" + explanation)
+            await update.message.reply_document(
+                document=out_bytes,
+                filename=f"MCE_filtered_scored___{Path(filename).stem}.xlsx",
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка обработки: {e}")
+        finally:
+            context.user_data["awaiting_filters"] = False
+            try:
+                shutil.rmtree(Path(local_path).parent, ignore_errors=True)
+            except Exception:
+                pass
+
         return
 
-    # ******* OPENAI ЧАТ ********
-    hist = get_history(uid)
-    hist.append(f"user: {text}")
+    # ---- создание лида из сообщения ----
+    lower = text.lower()
+    if lower.startswith("лид ") or lower.startswith("lead ") or text.startswith("/lead"):
+        # форматы:
+        #   "лид Тестовый лид"
+        #   "/lead Тестовый лид"
+        parts = text.split(maxsplit=1)
+        title = parts[1].strip() if len(parts) > 1 else "Лид из Telegram"
+        comment = f"Сообщение из Telegram: {text}\n\nUsername: @{update.effective_user.username or ''}"
 
+        await update.message.reply_text("Создаю лид в Битрикс24…")
+        result_msg = await create_bitrix_lead(title=title, comment=comment, tg_user=update.effective_user)
+        await update.message.reply_text(result_msg)
+        return
+
+    # ---- обычный чат → OpenAI ----
+    uid = update.effective_user.id
+    hist = get_history(uid)
+
+    hist.append(f"user: {text}")
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
     reply = await call_openai(hist)
     hist.append(f"assistant: {reply}")
-
     await update.message.reply_text(reply)
 
 
-# ========= ПРИЁМ ФАЙЛОВ =========
-
+# ========= ПРИЁМ ЛЮБЫХ ФАЙЛОВ =========
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.document:
+        return
+
     doc = update.message.document
-    filename = _safe_name(doc.file_name, "file.bin")
+    filename = _safe_name(doc.file_name or "file.bin", "file.bin")
     suffix = Path(filename).suffix.lower()
 
     tg_file = await doc.get_file()
     local_path = await _download_to_tmp(tg_file, filename)
 
-    # EXCEL/CSV
     if suffix in {".xlsx", ".xls", ".csv"}:
-        try:
-            df = pd.read_excel(local_path) if suffix != ".csv" else pd.read_csv(local_path)
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка чтения файла: {e}")
-            return
-
-        cols = ", ".join(map(str, df.columns))
-        context.user_data["pending_file"] = local_path
-        await update.message.reply_text(
-            f"Файл получен: {filename}\n"
-            f"Колонки: {cols}\n\n"
-            f"Отправь правила фильтрации. Пример:\n"
-            f"Название~насос; Сумма>1000000\n"
-        )
+        # ждём фильтры
+        context.user_data["pending_file_path"] = local_path
+        context.user_data["pending_file_name"] = filename
         context.user_data["awaiting_filters"] = True
-        return
 
-    # Обычный файл → просто вернуть обратно
-    with open(local_path, "rb") as f:
-        await update.message.reply_document(f, filename=filename)
+        try:
+            if suffix == ".csv":
+                df = pd.read_csv(local_path)
+            else:
+                df = pd.read_excel(local_path)
 
+            cols = " | ".join(map(str, df.columns[:12]))
+            await update.message.reply_text(
+                "Готово ✅\n"
+                f"Вход: {len(df)} строк.\n"
+                f"Колонки: {cols}\n\n"
+                "Отправь правила фильтрации одним сообщением.\n"
+                "Примеры:\n"
+                "  Цена<=100000; Регион~киев; Дедлайн>=2025-01-01\n"
+                "  Категория=Охрана; Заказчик~Министерство; Аванс=0\n\n"
+                "Операторы: =, !=, >, <, >=, <=, ~ (подстрока)"
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"Файл получил, но не смог прочитать таблицу ({e}). "
+                f"Возвращаю обратно."
+            )
+            with open(local_path, "rb") as f:
+                await update.message.reply_document(document=f, filename=filename)
+            shutil.rmtree(Path(local_path).parent, ignore_errors=True)
 
-# ========= ПРИМЕНЕНИЕ ФИЛЬТРОВ =========
-
-async def apply_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_filters"):
-        return
-
-    rules_text = update.message.text.strip()
-    local_path = context.user_data["pending_file"]
-    suffix = Path(local_path).suffix.lower()
-
-    df = pd.read_excel(local_path) if suffix != ".csv" else pd.read_csv(local_path)
-
-    rules = _parse_rules(rules_text)
-    df2, explanation = _apply_rules(df, rules)
-
-    out_bytes = _to_excel_bytes(df2)
-    await update.message.reply_text(explanation)
-    await update.message.reply_document(out_bytes, filename="filtered.xlsx")
-
-    context.user_data["awaiting_filters"] = False
-
-
-# ========= КОМАНДЫ =========
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот готов. Чтобы создать лид — напиши:\n\nлид текст лида")
-
-
-async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    THREADS.pop(update.effective_user.id, None)
-    context.user_data.clear()
-    await update.message.reply_text("Контекст очищен.")
+    else:
+        # просто вернуть файл
+        try:
+            with open(local_path, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=filename,
+                    caption="Файл получил — возвращаю обратно ✅",
+                )
+        finally:
+            shutil.rmtree(Path(local_path).parent, ignore_errors=True)
 
 
 # ========= ЗАПУСК =========
-
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
-
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, apply_filters))
+    app.add_handler(CommandHandler("lead", on_text))  # /lead тоже обрабатываем здесь
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     app.run_polling()
 
