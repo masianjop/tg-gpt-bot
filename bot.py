@@ -65,7 +65,7 @@ async def call_openai(lines: List[str]) -> str:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-        # OpenAI без прокси
+            # OpenAI идёт напрямую, без прокси
             r = await client.post(ENDPOINT, headers=headers, json=payload)
             r.raise_for_status()
             data = r.json()
@@ -118,10 +118,10 @@ async def fetch_gpb_tenders():
 
     proxies = None
     if GPB_PROXY_URL:
-        # ВАЖНО: ключи "http" и "https", а в значении — URL с протоколом
+        # Ключи должны быть с "://", как просит httpx
         proxies = {
-            "http": GPB_PROXY_URL,
-            "https": GPB_PROXY_URL,
+            "http://": GPB_PROXY_URL,
+            "https://": GPB_PROXY_URL,
         }
 
     async with httpx.AsyncClient(timeout=30, proxies=proxies) as client:
