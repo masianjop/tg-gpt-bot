@@ -29,7 +29,7 @@ BITRIX_WEBHOOK = os.environ.get("BITRIX_WEBHOOK", "").rstrip("/")
 BITRIX_METHOD_LEAD_ADD = "crm.lead.add.json"
 
 # ПРОКСИ ДЛЯ ГАЗПРОМБАНКА (РОССИЙСКИЙ HTTP/HTTPS ПРОКСИ)
-# пример: http://user:pass@123.123.123.123:12345
+# пример: http://user:pass@123.123.123.123:64336
 GPB_PROXY_URL = os.environ.get("GPB_PROXY_URL", "").strip()
 
 ENDPOINT = "https://api.openai.com/v1/chat/completions"
@@ -65,6 +65,7 @@ async def call_openai(lines: List[str]) -> str:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
+        # OpenAI без прокси
             r = await client.post(ENDPOINT, headers=headers, json=payload)
             r.raise_for_status()
             data = r.json()
@@ -116,14 +117,14 @@ async def fetch_gpb_tenders():
     url = "https://etpgaz.gazprombank.ru/api/procedures?late=1"
 
     proxies = None
-    # если указали GPB_PROXY_URL — используем его ТОЛЬКО для запросов к Газпромбанку
     if GPB_PROXY_URL:
+        # ВАЖНО: ключи "http" и "https", а в значении — URL с протоколом
         proxies = {
-            "http://": GPB_PROXY_URL,
-            "https://": GPB_PROXY_URL,
+            "http": GPB_PROXY_URL,
+            "https": GPB_PROXY_URL,
         }
 
-    async with httpx.AsyncClient(timeout=20, proxies=proxies) as client:
+    async with httpx.AsyncClient(timeout=30, proxies=proxies) as client:
         r = await client.get(url)
         r.raise_for_status()
         xml_text = r.text
