@@ -11,30 +11,29 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
 import httpx
+import json
 
 # ========= CONFIG =========
 load_dotenv()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENAI_PROJECT = os.environ.get("OPENAI_PROJECT", "")
+BITRIX_WEBHOOK = os.environ.get("BITRIX_WEBHOOK", "").rstrip("/")
 
 ENDPOINT = "https://api.openai.com/v1/chat/completions"
 MODEL = "gpt-4o-mini"
 
-# Порог суммы (можно менять через переменную окружения MIN_SUM; 0 = отключить порог)
-MIN_SUM = float(os.getenv("MIN_SUM", "0"))  # раньше было 1_000_000
-
-print(f"[BOT] endpoint={ENDPOINT} model={MODEL} project='{OPENAI_PROJECT}' min_sum={MIN_SUM}")
+print(f"[BOT] model={MODEL}")
 
 THREADS = {}
 
-SYSTEM_PROMPT = """Ты — ассистент отдела продаж МЦЭ Инжиниринг.
-Работаешь только с тендерами, лидами, сделками и таблицами.
-Не обсуждай товары, маркетплейсы, бытовую продукцию и прайс-листы.
-"""
+SYSTEM_PROMPT = """Ты — Product Data Assistant. Отвечай кратко и по делу."""
 
-# ========= OPENAI CALL (для обычного чата) =========
+
+# ========= OPENAI CALL =========
 async def call_openai(lines: list[str]) -> str:
     msgs = []
     for ln in lines:
@@ -59,10 +58,9 @@ async def call_openai(lines: list[str]) -> str:
             data = r.json()
             return data["choices"][0]["message"]["content"].strip()
 
-    except httpx.HTTPStatusError as e:
-        return f"⚠️ OpenAI {e.response.status_code}: {e.response.text}"
     except Exception as e:
-        return f"⚠️ Локальная ошибка: {e}"
+        return f"⚠️ Ошибка OpenAI: {e}"
+
 
 def get_history(uid: int) -> list[str]:
     hist = THREADS.setdefault(uid, [])
@@ -70,11 +68,47 @@ def get_history(uid: int) -> list[str]:
         hist.append(f"system: {SYSTEM_PROMPT}")
     return hist
 
-# ========= FS UTILS =========
+
+# ========= BITRIX24 — СОЗДАНИЕ ЛИДА =========
+
+async def send_lead_to_bitrix(title: str, description: str, phone: str = "", name: str = ""):
+    if not BITRIX_WEBHOOK:
+        return "❌ Переменная BITRIX_WEBHOOK не установлена!"
+
+    url = f"{BITRIX_WEBHOOK}/crm.lead.add.json"
+
+    payload = {
+        "fields": {
+            "TITLE": title,
+            "NAME": name if name else "Telegram",
+            "COMMENTS": description,
+            "PHONE": [{"VALUE": phone, "VALUE_TYPE": "WORK"}] if phone else [],
+        },
+        "params": {"REGISTER_SONET_EVENT": "Y"}
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+
+        if "result" in data:
+            return f"✅ Лид создан: ID {data['result']}"
+        else:
+            return f"⚠️ Ошибка Bitrix: {data}"
+
+    except Exception as e:
+        return f"⚠️ Bitrix ошибка: {e}"
+
+
+# ========= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =========
+
 def _safe_name(name: str, fallback: str) -> str:
     base = name or fallback
     base = Path(base).name
     return re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+
 
 async def _download_to_tmp(tg_file, filename: str) -> str:
     tmpdir = tempfile.mkdtemp(prefix="tgbot_")
@@ -82,303 +116,190 @@ async def _download_to_tmp(tg_file, filename: str) -> str:
     await tg_file.download_to_drive(local_path)
     return local_path
 
-def _to_excel_bytes(df: pd.DataFrame, sheet="MCE_scored") -> bytes:
+
+# ========== EXCEL/CSV ФИЛЬТРАЦИЯ ==========
+
+_RULE_RE = re.compile(r"^\s*(.+?)\s*(<=|>=|=|!=|<|>|~)\s*(.+?)\s*$", re.IGNORECASE)
+
+def _coerce_series(s: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(s, errors="ignore", dayfirst=True)
+    if dt.notna().sum() >= len(s) * 0.3:
+        return dt
+    num = pd.to_numeric(s.astype(str).str.replace(" ", "").str.replace(",", "."), errors="ignore")
+    if pd.to_numeric(num, errors="coerce").notna().sum() >= len(s) * 0.3:
+        return num
+    return s.astype(str).str.lower()
+
+
+def _parse_rules(text: str):
+    parts = [p for p in re.split(r"[;\n]+", text) if p.strip()]
+    rules = []
+    for p in parts:
+        m = _RULE_RE.match(p)
+        if m:
+            rules.append((m.group(1).strip(), m.group(2), m.group(3).strip()))
+    return rules
+
+
+def _apply_rules(df: pd.DataFrame, rules):
+    if df.empty or not rules:
+        return df, "Правил нет — ничего не фильтровал."
+
+    explain = []
+    mask = pd.Series(True, index=df.index)
+    colmap = {str(c).strip().lower(): c for c in df.columns}
+
+    for col_raw, op, val_raw in rules:
+        key = col_raw.lower()
+        if key not in colmap:
+            explain.append(f"⚠️ Колонка «{col_raw}» не найдена.")
+            continue
+
+        col = colmap[key]
+        s = _coerce_series(df[col])
+
+        val = val_raw
+        if pd.api.types.is_numeric_dtype(s):
+            try: val = float(val_raw)
+            except: pass
+        elif pd.api.types.is_datetime64_any_dtype(s):
+            val = pd.to_datetime(val_raw, errors="coerce")
+
+        m = pd.Series(True, index=df.index)
+        if op == "=":   m = s == val
+        if op == "!=":  m = s != val
+        if op == ">":   m = s > val
+        if op == "<":   m = s < val
+        if op == ">=":  m = s >= val
+        if op == "<=":  m = s <= val
+        if op == "~":   m = s.astype(str).str.contains(str(val_raw).lower(), na=False)
+
+        mask &= m
+        explain.append(f"{col}: {op} {val_raw} — прошло {m.sum()}")
+
+    df2 = df[mask].copy()
+    explain.insert(0, f"Итого прошло {len(df2)} из {len(df)}")
+    return df2, "\n".join(explain)
+
+
+def _to_excel_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name=sheet)
+        df.to_excel(w, index=False, sheet_name="filtered")
     buf.seek(0)
     return buf.read()
 
-# ========= АЛИАСЫ КОЛОНОК =========
-NAME_ALIASES = [
-    "название","название сделки","название лида","наименование","предмет","тема","лот"
-]
-COMPANY_ALIASES = [
-    "компания","заказчик","покупатель","организация","клиент","контрагент","инициатор"
-]
-AMOUNT_ALIASES = [
-    "сумма","бюджет","нмцк","начальная цена","стоимость","price","amount","total","макс цена"
-]
 
-def _find_col(df: pd.DataFrame, aliases) -> str | None:
-    cols_map = {str(c).strip().lower(): c for c in df.columns}
-    for a in aliases:
-        if a in cols_map:
-            return cols_map[a]
-    for key, c in cols_map.items():
-        if any(a in key for a in aliases):
-            return c
-    return None
+# ========= ОБРАБОТКА ТЕКСТА =========
 
-# ========= СЕМАНТИКА =========
-KEYWORDS = [
-    # учёт/измерение/узлы
-    "сикг","сикн","сикнс","сикк","уирг","ууг","уун","асн","асу тп","асутп",
-    "узел учета","узел учёта","узел измерения","узел редуцирования",
-    "измеритель","измерительная установка","система измерен","система контроля",
-    # агзу и измерительные установки
-    "агзу","измерительная установка",
-    # налив/слив/эстакады
-    "система налива","пункт налива","станция налива","система слива","пункт слива","эстакада",
-    "налив нефти","слив нефти","налив метанола","герметичный налив",
-    # дозирование реагентов
-    "установка дозирования","дозирован","узел ввода реагентов","удх","удхб",
-    # блочное/модульное
-    "блок-бокс","блочный","модульный блок","технологический блок","блочно-модульная",
-    # пробоотбор/аналитика/лаборатории
-    "пробоотбор","пробоотборник","сог","хал","лаборатор","химико-аналитичес","газоаналитичес",
-    "анализатор","хроматограф","метрологический стенд","поверочный стенд","испытательный стенд",
-    # кип/приборка/датчики/уровень/расход/давление
-    "кип","контрольно-измерительн","датчик","датчики","манометр","уровнемер","расходомер",
-    "термометр","термопара","тсп","ртд","манифольд","диафрагма",
-    # смежные термины
-    "пнр","шмр","пир","модернизация","проектирование","комплекс поставки"
-]
-
-CLIENTS = [
-    "газпром","газпромнефть","лукойл","роснефть","славнефть","самаранефтегаз","няганьнефть",
-    "восток-оил","инк","ннк","ритэк","башнефть","метафракс","еврохим","русснефть",
-    "томскнефть","мессояханефтегаз","русгаз","бск","козс","татнефть"
-]
-
-LEAD_PATTERNS = [
-    r"^ткп", r"^ап", r"^com", "запрос", "поставка",
-    "система","узел","модернизация","проектирование","комплекс","блок","асутп","асу тп"
-]
-
-# ========= СКОРИНГ =========
-def _any_in(text: str, bag) -> bool:
-    t = str(text).lower()
-    return any(k in t for k in bag)
-
-def _any_re(text: str, patterns) -> bool:
-    t = str(text)
-    return any(re.search(p, t, re.IGNORECASE) for p in patterns)
-
-def _score_keywords(s: str) -> int:   # 0–4
-    t = str(s).lower()
-    hits = sum(k in t for k in KEYWORDS)
-    if hits >= 4: return 4
-    if hits == 3: return 3
-    if hits == 2: return 2
-    if hits == 1: return 1
-    return 0
-
-def _score_client(s: str) -> int:     # 0–3
-    return 3 if _any_in(s, CLIENTS) else 0
-
-def _score_amount(a: float) -> int:   # 0–2
-    try:
-        a = float(a)
-    except:
-        a = 0.0
-    if a >= 300_000_000: return 2
-    if a >= 50_000_000:  return 1
-    return 0
-
-def _score_pattern(s: str) -> int:    # 0–1
-    return 1 if _any_re(s, LEAD_PATTERNS) else 0
-
-def _priority(total: int) -> str:
-    if total >= 7: return "High"
-    if total >= 4: return "Medium"
-    return "Low"
-
-def _reason(row) -> str:
-    parts = []
-    if row["Score_keywords(0-4)"] > 0: parts.append("направления/ключевые слова")
-    if row["Score_client(0-3)"] > 0:   parts.append("целевой заказчик")
-    if row["Score_amount(0-2)"] > 0:   parts.append("масштаб сделки")
-    if row["Score_pattern(0-1)"] > 0:  parts.append("тендерный шаблон")
-    return ", ".join(parts) if parts else "значимых совпадений нет"
-
-def mce_filter_scored(df_in: pd.DataFrame) -> (pd.DataFrame, dict):
-    df = df_in.copy().fillna("")
-    # авто-поиск колонок
-    name_col    = _find_col(df, NAME_ALIASES)    or "Название"
-    company_col = _find_col(df, COMPANY_ALIASES) or "Компания"
-    amount_col  = _find_col(df, AMOUNT_ALIASES)  or "Сумма"
-
-    if name_col not in df.columns:    df[name_col] = ""
-    if company_col not in df.columns: df[company_col] = ""
-    if amount_col not in df.columns:  df[amount_col] = 0
-
-    df[name_col]    = df[name_col].astype(str)
-    df[company_col] = df[company_col].astype(str)
-
-    # скоринг
-    kw  = df[name_col].apply(_score_keywords)
-    cl  = df[company_col].apply(_score_client)
-    amt_vals = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0)
-    amt = amt_vals.apply(_score_amount)
-    pat = df[name_col].apply(_score_pattern)
-
-    df["Score_keywords(0-4)"] = kw
-    df["Score_client(0-3)"]   = cl
-    df["Score_amount(0-2)"]   = amt
-    df["Score_pattern(0-1)"]  = pat
-    df["Score_total(0-10)"]   = df[[
-        "Score_keywords(0-4)","Score_client(0-3)","Score_amount(0-2)","Score_pattern(0-1)"
-    ]].sum(axis=1)
-
-    # базовый смысловой проход
-    base_mask = (kw >= 1) | (cl >= 1) | (pat >= 1)
-
-    # НОВОЕ ПРАВИЛО СУММЫ:
-    # - если MIN_SUM == 0 → не отсеивать по сумме (только по смыслу)
-    # - если MIN_SUM > 0 → пропускать суммы >= MIN_SUM
-    #   и также пропускать "наши" строки даже при 0 сумме: (kw>=1 или pat>=1)
-    if MIN_SUM <= 0:
-        sum_mask = (amt_vals >= 0)  # всегда True
-    else:
-        sum_mask = (amt_vals >= MIN_SUM) | (kw >= 1) | (pat >= 1)
-
-    out = df[base_mask & sum_mask].copy()
-    out["Priority"] = out["Score_total(0-10)"].apply(_priority)
-    out["Причина"] = out.apply(_reason, axis=1)
-
-    # сортировка
-    prio_order = {"High":0, "Medium":1, "Low":2}
-    out = out.sort_values(
-        by=["Priority","Score_total(0-10)", amount_col],
-        key=lambda s: s.map(prio_order) if s.name=="Priority" else pd.to_numeric(s, errors="coerce"),
-        ascending=[True, False, False]
-    )
-
-    # Диагностика для сообщения
-    diag = {
-        "name_col": name_col,
-        "company_col": company_col,
-        "amount_col": amount_col,
-        "kw_hits": int((kw >= 1).sum()),
-        "client_hits": int((cl >= 1).sum()),
-        "pattern_hits": int((pat >= 1).sum()),
-        "sum_ge_min": int((amt_vals >= MIN_SUM).sum()) if MIN_SUM > 0 else len(df),
-        "total_in": len(df),
-        "total_out": len(out)
-    }
-    return out, diag
-
-# ========= КОМАНДЫ =========
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Кидай Excel/CSV — я отфильтрую тендеры, поставлю приоритеты и объясню почему выбрал.\n"
-        "Команда: /reset — очистить контекст."
-    )
-
-async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    THREADS.pop(update.effective_user.id, None)
-    context.user_data.clear()
-    await update.message.reply_text("Контекст очищен ✅")
-
-# ========= ТЕКСТ (чат с LLM) =========
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-    uid = update.effective_user.id
-    user_text = update.message.text.strip()
-    hist = get_history(uid)
 
-    hist.append(f"user: {user_text}")
+    uid = update.effective_user.id
+    text = update.message.text.strip()
+
+    # ******* СОЗДАНИЕ ЛИДА ********
+    if text.lower().startswith("лид "):
+        title = "Лид из Telegram"
+        desc = text[4:].strip()
+        ans = await send_lead_to_bitrix(title, desc)
+        await update.message.reply_text(ans)
+        return
+
+    # ******* OPENAI ЧАТ ********
+    hist = get_history(uid)
+    hist.append(f"user: {text}")
+
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
     reply = await call_openai(hist)
     hist.append(f"assistant: {reply}")
+
     await update.message.reply_text(reply)
 
+
 # ========= ПРИЁМ ФАЙЛОВ =========
-def _read_table_any(local_path: str, suffix: str) -> pd.DataFrame:
-    if suffix == ".csv":
-        try:
-            return pd.read_csv(local_path, sep=None, engine="python")
-        except Exception:
-            return pd.read_csv(local_path, sep=None, engine="python", encoding="cp1251", on_bad_lines="skip")
-    else:
-        try:
-            return pd.read_excel(local_path)
-        except Exception:
-            return pd.read_excel(local_path, engine="openpyxl")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.document:
-        return
-
     doc = update.message.document
-    filename = _safe_name(doc.file_name or "file.bin", "file.bin")
+    filename = _safe_name(doc.file_name, "file.bin")
     suffix = Path(filename).suffix.lower()
 
     tg_file = await doc.get_file()
     local_path = await _download_to_tmp(tg_file, filename)
 
+    # EXCEL/CSV
     if suffix in {".xlsx", ".xls", ".csv"}:
         try:
-            df = _read_table_any(local_path, suffix)
-            scored, diag = mce_filter_scored(df)
-
-            total_in  = diag["total_in"]
-            total_out = diag["total_out"]
-            by_prio = scored["Priority"].value_counts().to_dict() if total_out else {}
-            high = by_prio.get("High", 0)
-            med  = by_prio.get("Medium", 0)
-            low  = by_prio.get("Low", 0)
-
-            # превью 5 строк с причинами
-            preview_rows = []
-            if total_out:
-                name_col = diag["name_col"]
-                for _, row in scored.head(5).iterrows():
-                    title = str(row.get(name_col, ""))[:140]
-                    prio  = row["Priority"]
-                    sc    = row["Score_total(0-10)"]
-                    why   = row["Причина"]
-                    preview_rows.append(f"• [{prio} | {sc}] {title}\n   — {why}")
-
-            out_bytes = _to_excel_bytes(scored, sheet="MCE_scored")
-
-            diag_text = (
-                f"Колонки: Название→{diag['name_col']} | Компания→{diag['company_col']} | Сумма→{diag['amount_col']}\n"
-                f"Совпадения: keywords={diag['kw_hits']}, clients={diag['client_hits']}, patterns={diag['pattern_hits']}"
-                + (f", суммы≥{int(MIN_SUM):,}={diag['sum_ge_min']}".replace(",", " ") if MIN_SUM>0 else "")
-            )
-
-            await update.message.reply_text(
-                "Готово ✅\n"
-                f"Вход: {total_in} • Отобрано: {total_out}\n"
-                f"Приоритеты — High: {high}, Medium: {med}, Low: {low}\n"
-                f"{diag_text}\n\n"
-                + ("\n".join(preview_rows) if preview_rows else "Совпадений есть мало или суммы отсутствуют — проверь названия/клиента/сумму.")
-            )
-            await update.message.reply_document(
-                document=out_bytes,
-                filename=f"MCE_filtered_scored_{Path(filename).stem}.xlsx",
-            )
-
+            df = pd.read_excel(local_path) if suffix != ".csv" else pd.read_csv(local_path)
         except Exception as e:
-            await update.message.reply_text(f"Ошибка обработки таблицы: {e}")
-        finally:
-            shutil.rmtree(Path(local_path).parent, ignore_errors=True)
+            await update.message.reply_text(f"Ошибка чтения файла: {e}")
+            return
+
+        cols = ", ".join(map(str, df.columns))
+        context.user_data["pending_file"] = local_path
+        await update.message.reply_text(
+            f"Файл получен: {filename}\n"
+            f"Колонки: {cols}\n\n"
+            f"Отправь правила фильтрации. Пример:\n"
+            f"Название~насос; Сумма>1000000\n"
+        )
+        context.user_data["awaiting_filters"] = True
         return
 
-    # Прочие файлы — эхо
-    try:
-        with open(local_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=filename,
-                caption="Файл получил — возвращаю обратно ✅",
-            )
-    finally:
-        shutil.rmtree(Path(local_path).parent, ignore_errors=True)
+    # Обычный файл → просто вернуть обратно
+    with open(local_path, "rb") as f:
+        await update.message.reply_document(f, filename=filename)
+
+
+# ========= ПРИМЕНЕНИЕ ФИЛЬТРОВ =========
+
+async def apply_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_filters"):
+        return
+
+    rules_text = update.message.text.strip()
+    local_path = context.user_data["pending_file"]
+    suffix = Path(local_path).suffix.lower()
+
+    df = pd.read_excel(local_path) if suffix != ".csv" else pd.read_csv(local_path)
+
+    rules = _parse_rules(rules_text)
+    df2, explanation = _apply_rules(df, rules)
+
+    out_bytes = _to_excel_bytes(df2)
+    await update.message.reply_text(explanation)
+    await update.message.reply_document(out_bytes, filename="filtered.xlsx")
+
+    context.user_data["awaiting_filters"] = False
+
+
+# ========= КОМАНДЫ =========
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Бот готов. Чтобы создать лид — напиши:\n\nлид текст лида")
+
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    THREADS.pop(update.effective_user.id, None)
+    context.user_data.clear()
+    await update.message.reply_text("Контекст очищен.")
+
 
 # ========= ЗАПУСК =========
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, apply_filters))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
