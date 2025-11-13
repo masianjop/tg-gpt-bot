@@ -121,10 +121,7 @@ async def fetch_gpb_tenders():
 
     tenders = []
 
-    # Называния тегов могут отличаться, поэтому берём универсально:
-    # предполагаем структуру вида <Procedures><Procedure>...</Procedure>...</Procedures>
     for proc in root.findall(".//Procedure"):
-        # пробуем разные варианты названий полей
         number = (
             proc.findtext("Number")
             or proc.findtext("ProcedureNumber")
@@ -163,14 +160,9 @@ async def tenders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         items = await fetch_gpb_tenders()
-    except httpx.RequestError:
-        await update.message.reply_text("API временно недоступно")
-        return
-    except httpx.HTTPStatusError:
-        await update.message.reply_text("API временно недоступно")
-        return
     except Exception as e:
-        await update.message.reply_text(f"Ошибка при работе с API: {e}")
+        # временно показываем детальную ошибку, чтобы понять, что именно не так
+        await update.message.reply_text(f"API ошибка: {e}")
         return
 
     if not items:
@@ -179,7 +171,6 @@ async def tenders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "📄 *Тендеры Газпромбанка*\n\n"
 
-    # чтобы не спамить — первые 20
     for t in items[:20]:
         text += (
             f"🔹 *Процедура:* {t['number']}\n"
@@ -232,7 +223,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     lower = text.lower()
 
-    # создание лида: "лид ..." или "/lead ..."
+    # создание лида
     if lower.startswith("лид ") or lower.startswith("lead ") or text.startswith("/lead"):
         parts = text.split(maxsplit=1)
         title = parts[1].strip() if len(parts) > 1 else "Лид из Telegram"
@@ -270,13 +261,9 @@ def main():
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("gpb", gpb_cmd))
 
-    # тендеры
     app.add_handler(CommandHandler("tenders", tenders_cmd))
-
-    # /lead тоже идёт через общий обработчик текста
     app.add_handler(CommandHandler("lead", on_text))
 
-    # обычный текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     app.run_polling()
