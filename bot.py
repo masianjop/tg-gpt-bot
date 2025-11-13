@@ -1,11 +1,7 @@
 import os
 import re
-import io
-import tempfile
-import shutil
 from pathlib import Path
 
-import pandas as pd
 from dotenv import load_dotenv
 
 from telegram import Update
@@ -18,6 +14,7 @@ from telegram.ext import (
 )
 
 import httpx
+import xml.etree.ElementTree as ET
 
 
 # ========= CONFIG =========
@@ -39,10 +36,7 @@ print(f"[BOT] bitrix={BITRIX_WEBHOOK or 'NO BITRIX_WEBHOOK'}")
 
 THREADS: dict[int, list[str]] = {}
 
-
-SYSTEM_PROMPT = """Ты — Product Data Assistant. Отвечай кратко, по делу, на русском.
-Если тема — данные о товарах или таблицы, задавай уточняющие вопросы.
-"""
+SYSTEM_PROMPT = """Ты — Product Data Assistant. Отвечай кратко, по делу, на русском."""
 
 
 # ========= OPENAI CALL =========
@@ -88,8 +82,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я готов работать.\n"
         "Команды:\n"
+        "  /tenders — тендеры Газпромбанк XML\n"
         "  /lead текст — создать лид в Битрикс24\n"
-        "  /gpb — тест команды Газпромбанк\n"
         "  /reset — очистить контекст"
     )
 
@@ -100,117 +94,68 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Контекст очищен ✅")
 
 
-# ========= НОВАЯ КОМАНДА /gpb =========
 async def gpb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Команда /gpb работает. Позже сюда подключим парсинг тендеров Газпромбанка."
-    )
+    await update.message.reply_text("Команда /gpb работает.")
 
 
-# ========= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ФАЙЛОВ =========
-def _safe_name(name: str, fallback: str) -> str:
-    base = name or fallback
-    base = Path(base).name
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+# ========= 🚀 НОВОЕ! ЗАГРУЗКА XML ТЕНДЕРОВ =========
+async def fetch_gpb_tenders():
+    url = "https://etpgaz.gazprombank.ru/api/procedures?late=1"
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        xml_text = r.text
+
+    root = ET.fromstring(xml_text)
+
+    tenders = []
+
+    for proc in root.findall(".//Procedure"):
+        number = proc.findtext("Number", "—")
+        lot = proc.findtext("LotNumber", "—")
+        status = proc.findtext("Status", "—")
+
+        link = f"https://etpgaz.gazprombank.ru/Procedure/{number}"
+
+        tenders.append({
+            "number": number,
+            "lot": lot,
+            "status": status,
+            "link": link
+        })
+
+    return tenders
 
 
-async def _download_to_tmp(tg_file, filename: str) -> str:
-    tmpdir = tempfile.mkdtemp(prefix="tgbot_")
-    local_path = os.path.join(tmpdir, filename)
-    await tg_file.download_to_drive(local_path)
-    return local_path
+# ========= 🚀 КОМАНДА /tenders =========
+async def tenders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Загружаю XML тендеры…")
+
+    try:
+        items = await fetch_gpb_tenders()
+
+        if not items:
+            await update.message.reply_text("❌ Нет данных.")
+            return
+
+        text = "📄 *Тендеры Газпромбанк (последние)*\n\n"
+
+        for t in items[:20]:
+            text += (
+                f"🔹 *Процедура:* {t['number']}\n"
+                f"   *Лот:* {t['lot']}\n"
+                f"   *Статус:* {t['status']}\n"
+                f"   [Открыть]({t['link']})\n\n"
+            )
+
+        await update.message.reply_markdown(text)
+
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
 
 
-# ========== ФИЛЬТРАЦИЯ EXCEL/CSV ==========
-_RULE_RE = re.compile(r"^\s*(.+?)\s*(<=|>=|=|!=|<|>|~)\s*(.+?)\s*$", re.IGNORECASE)
-
-
-def _coerce_series(s: pd.Series) -> pd.Series:
-    dt = pd.to_datetime(s, errors="coerce", dayfirst=True, infer_datetime_format=True)
-    if dt.notna().sum() >= max(2, int(len(s) * 0.2)):
-        return dt
-
-    num = pd.to_numeric(
-        s.astype(str).str.replace(" ", "").str.replace(",", "."),
-        errors="coerce",
-    )
-    if num.notna().sum() >= max(2, int(len(s) * 0.2)):
-        return num
-
-    return s.astype(str).str.lower()
-
-
-def _parse_rules(text: str):
-    parts = [p for p in re.split(r"[;\n]+", text) if p.strip()]
-    rules = []
-    for p in parts:
-        m = _RULE_RE.match(p)
-        if m:
-            rules.append((m.group(1).strip(), m.group(2), m.group(3).strip()))
-    return rules
-
-
-def _apply_rules(df: pd.DataFrame, rules):
-    if df.empty or not rules:
-        return df, "Правил нет — ничего не фильтровал."
-
-    explain = []
-    mask = pd.Series(True, index=df.index)
-    colmap = {str(c).strip().lower(): c for c in df.columns}
-
-    for col_raw, op, val_raw in rules:
-        key = col_raw.lower()
-        if key not in colmap:
-            explain.append(f"⚠️ Колонка «{col_raw}» не найдена — пропустил.")
-            continue
-
-        col = colmap[key]
-        s = _coerce_series(df[col])
-
-        val = val_raw
-        if pd.api.types.is_datetime64_any_dtype(s):
-            val = pd.to_datetime(val_raw, errors="coerce", dayfirst=True)
-        elif pd.api.types.is_numeric_dtype(s):
-            try:
-                val = float(str(val_raw).replace(" ", "").replace(",", "."))
-            except Exception:
-                val = None
-        else:
-            val = str(val_raw).lower()
-
-        m = pd.Series(True, index=df.index)
-        if op == "=":
-            m = s.eq(val)
-        elif op == "!=":
-            m = s.ne(val)
-        elif op == ">":
-            m = s.gt(val)
-        elif op == "<":
-            m = s.lt(val)
-        elif op == ">=":
-            m = s.ge(val)
-        elif op == "<=":
-            m = s.le(val)
-        elif op == "~":
-            m = s.astype(str).str.contains(re.escape(str(val)), na=False)
-
-        mask &= m
-        explain.append(f"✅ {col} {op} {val_raw} — прошло {int(m.sum())}")
-
-    df2 = df[mask].copy()
-    explain.insert(0, f"Итого прошло {len(df2)} из {len(df)}")
-    return df2, "\n".join(explain)
-
-
-def _to_excel_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="filtered")
-    buf.seek(0)
-    return buf.read()
-
-
-# ========= BITRIX: СОЗДАНИЕ ЛИДА =========
+# ========= BITRIX =========
 async def create_bitrix_lead(title: str, comment: str, tg_user) -> str:
 
     if not BITRIX_WEBHOOK:
@@ -251,44 +196,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
-    # правила фильтрации Excel/CSV
-    if context.user_data.get("awaiting_filters") and context.user_data.get("pending_file_path"):
-        rules_text = text
-        local_path = context.user_data["pending_file_path"]
-        filename = context.user_data.get("pending_file_name", "filtered.xlsx")
-        suffix = Path(filename).suffix.lower()
-
-        try:
-            if suffix == ".csv":
-                df = pd.read_csv(local_path)
-            else:
-                df = pd.read_excel(local_path)
-
-            rules = _parse_rules(rules_text)
-            df2, explanation = _apply_rules(df, rules)
-
-            out_bytes = _to_excel_bytes(df2)
-            await update.message.reply_text("Готово ✅\n" + explanation)
-            await update.message.reply_document(
-                document=out_bytes,
-                filename=f"MCE_filtered_scored___{Path(filename).stem}.xlsx",
-            )
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка: {e}")
-        finally:
-            context.user_data["awaiting_filters"] = False
-            try:
-                shutil.rmtree(Path(local_path).parent, ignore_errors=True)
-            except Exception:
-                pass
-
-        return
-
     # создание лида
     lower = text.lower()
     if lower.startswith("лид ") or lower.startswith("lead ") or text.startswith("/lead"):
         parts = text.split(maxsplit=1)
         title = parts[1].strip() if len(parts) > 1 else "Лид из Telegram"
+
         comment = (
             f"Сообщение из Telegram: {text}\n\n"
             f"Username: @{update.effective_user.username or ''}"
@@ -314,59 +227,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 
-# ========= ЛЮБЫЕ ФАЙЛЫ =========
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.document:
-        return
-
-    doc = update.message.document
-    filename = _safe_name(doc.file_name or "file.bin", "file.bin")
-    suffix = Path(filename).suffix.lower()
-
-    tg_file = await doc.get_file()
-    local_path = await _download_to_tmp(tg_file, filename)
-
-    if suffix in {".xlsx", ".xls", ".csv"}:
-        context.user_data["pending_file_path"] = local_path
-        context.user_data["pending_file_name"] = filename
-        context.user_data["awaiting_filters"] = True
-
-        try:
-            if suffix == ".csv":
-                df = pd.read_csv(local_path)
-            else:
-                df = pd.read_excel(local_path)
-
-            cols = " | ".join(map(str, df.columns[:12]))
-            await update.message.reply_text(
-                "Готово ✅\n"
-                f"Вход: {len(df)} строк.\n"
-                f"Колонки: {cols}\n\n"
-                "Отправь правила фильтрации."
-            )
-        except Exception as e:
-            await update.message.reply_text(
-                f"Файл получил, но не смог прочитать таблицу ({e})."
-            )
-            with open(local_path, "rb") as f:
-                await update.message.reply_document(
-                    document=f,
-                    filename=filename
-                )
-            shutil.rmtree(Path(local_path).parent, ignore_errors=True)
-
-    else:
-        try:
-            with open(local_path, "rb") as f:
-                await update.message.reply_document(
-                    document=f,
-                    filename=filename,
-                    caption="Файл получил — возвращаю обратно."
-                )
-        finally:
-            shutil.rmtree(Path(local_path).parent, ignore_errors=True)
-
-
 # ========= MAIN =========
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -375,8 +235,9 @@ def main():
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("lead", on_text))
     app.add_handler(CommandHandler("gpb", gpb_cmd))
+    app.add_handler(CommandHandler("tenders", tenders_cmd))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     app.run_polling()
 
