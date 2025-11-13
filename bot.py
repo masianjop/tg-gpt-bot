@@ -113,8 +113,8 @@ async def fetch_gpb_tenders():
     Тянем XML с тендерами и возвращаем список словарей:
     {"number": ..., "lot": ..., "status": ..., "link": ...}
     """
-    # КЛЮЧЕВОЕ изменение: http:// вместо https://
-    url = "http://etpgaz.gazprombank.ru/api/procedures?late=1"
+    # снова идём на https, но уже с follow_redirects=True
+    url = "https://etpgaz.gazprombank.ru/api/procedures?late=1"
 
     proxies = None
     if GPB_PROXY_URL:
@@ -123,7 +123,11 @@ async def fetch_gpb_tenders():
             "https://": GPB_PROXY_URL,
         }
 
-    async with httpx.AsyncClient(timeout=30, proxies=proxies) as client:
+    async with httpx.AsyncClient(
+        timeout=30,
+        proxies=proxies,
+        follow_redirects=True,
+    ) as client:
         r = await client.get(url)
         status = r.status_code
         text = r.text
