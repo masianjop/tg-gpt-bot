@@ -28,11 +28,16 @@ OPENAI_PROJECT = os.environ.get("OPENAI_PROJECT", "")
 BITRIX_WEBHOOK = os.environ.get("BITRIX_WEBHOOK", "").rstrip("/")
 BITRIX_METHOD_LEAD_ADD = "crm.lead.add.json"
 
+# ПРОКСИ ДЛЯ ГАЗПРОМБАНКА (РОССИЙСКИЙ HTTP/HTTPS ПРОКСИ)
+# пример: http://user:pass@123.123.123.123:12345
+GPB_PROXY_URL = os.environ.get("GPB_PROXY_URL", "").strip()
+
 ENDPOINT = "https://api.openai.com/v1/chat/completions"
 MODEL = "gpt-4o-mini"
 
 print(f"[BOT] model={MODEL}")
 print(f"[BOT] bitrix={BITRIX_WEBHOOK or 'NO BITRIX_WEBHOOK'}")
+print(f"[BOT] GPB_PROXY_URL={'SET' if GPB_PROXY_URL else 'NOT SET'}")
 
 THREADS: Dict[int, List[str]] = {}
 
@@ -110,7 +115,15 @@ async def fetch_gpb_tenders():
     """
     url = "https://etpgaz.gazprombank.ru/api/procedures?late=1"
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    proxies = None
+    # если указали GPB_PROXY_URL — используем его ТОЛЬКО для запросов к Газпромбанку
+    if GPB_PROXY_URL:
+        proxies = {
+            "http://": GPB_PROXY_URL,
+            "https://": GPB_PROXY_URL,
+        }
+
+    async with httpx.AsyncClient(timeout=20, proxies=proxies) as client:
         r = await client.get(url)
         r.raise_for_status()
         xml_text = r.text
@@ -163,7 +176,7 @@ async def tenders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         items = await fetch_gpb_tenders()
     except Exception as e:
         tb = traceback.format_exc()
-        print("[TENDERS_ERROR]", tb)  # увидишь это в Deploy Logs на Railway
+        print("[TENDERS_ERROR]", tb)
 
         msg = f"{type(e).__name__}"
         if str(e):
