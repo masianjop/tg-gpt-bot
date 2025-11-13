@@ -1,5 +1,6 @@
 import os
 from typing import Dict, List
+import traceback
 
 from dotenv import load_dotenv
 
@@ -161,8 +162,14 @@ async def tenders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         items = await fetch_gpb_tenders()
     except Exception as e:
-        # временно показываем детальную ошибку, чтобы понять, что именно не так
-        await update.message.reply_text(f"API ошибка: {e}")
+        tb = traceback.format_exc()
+        print("[TENDERS_ERROR]", tb)  # увидишь это в Deploy Logs на Railway
+
+        msg = f"{type(e).__name__}"
+        if str(e):
+            msg += f": {e}"
+
+        await update.message.reply_text(f"API ошибка: {msg}")
         return
 
     if not items:
