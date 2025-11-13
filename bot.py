@@ -113,7 +113,8 @@ async def fetch_gpb_tenders():
     Тянем XML с тендерами и возвращаем список словарей:
     {"number": ..., "lot": ..., "status": ..., "link": ...}
     """
-    url = "https://etpgaz.gazprombank.ru/api/procedures?late=1"
+    # КЛЮЧЕВОЕ изменение: http:// вместо https://
+    url = "http://etpgaz.gazprombank.ru/api/procedures?late=1"
 
     proxies = None
     if GPB_PROXY_URL:
@@ -142,7 +143,6 @@ async def fetch_gpb_tenders():
     try:
         root = ET.fromstring(text)
     except ET.ParseError as e:
-        # кидаем понятную ошибку с кусочком тела
         raise RuntimeError(
             f"Ошибка парсинга XML: {e}. Начало ответа: {text[:200]!r}"
         )
@@ -196,7 +196,6 @@ async def tenders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if str(e):
             msg += f": {e}"
 
-        # покажем полную причину
         await update.message.reply_text(f"API ошибка: {msg}")
         return
 
